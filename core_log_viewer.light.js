@@ -2,7 +2,7 @@
    Contains: FGDC lithology pattern data + main viewer application
    (all patterns and heavy computation live here, per the HTML/JS split). */
 
-const APP_VERSION = "v1.2.1";
+const APP_VERSION = "v1.2.2";
 const APP_BUILD_DATE = "2026-09-03";
 if (typeof window !== "undefined") window.CORE_LOG_VIEWER_VERSION = APP_VERSION;
 
@@ -6045,6 +6045,7 @@ const XRD_COLOR = Object.freeze({
   /* clays — greens */
   "Illite":      "#7A8870",
   "Smectite":    "#9BAA82",
+  "Montmorillonite":"#A4B18A",
   "Kaolinite":   "#B6C29A",
   "Chlorite":    "#5E7A5B",
   "Mica":        "#8A9A7A",
@@ -6082,7 +6083,7 @@ const XRD_FALLBACK = Object.freeze(["#B8C09A","#D4B6BA","#C5CBB5","#CCCCCC","#A8
 const XRD_MOTIF = Object.freeze({
   "Quartz":"dots", "Plagioclase":"dots", "K-feldspar":"dots", "Feldspar":"dots",
   "Calcite":"bricks", "Dolomite":"rhombi", "Siderite":"bricks", "Ankerite":"rhombi",
-  "Illite":"stripes", "Smectite":"stripes", "Kaolinite":"stripes", "Chlorite":"stripes",
+  "Illite":"stripes", "Smectite":"stripes", "Montmorillonite":"stripes", "Kaolinite":"stripes", "Chlorite":"stripes",
   "Mica":"stripes", "Muscovite":"stripes", "Biotite":"stripes", "Clay":"stripes",
   "Pyrite":"xhatch",
   "Anhydrite":"hatch", "Gypsum":"crosshatch", "Halite":"plus", "Barite":"hatch",
@@ -6208,11 +6209,48 @@ function xrdMotifPitch(motif){
 function xrdSafeIdSuffix(name){
   return String(name).replace(/[^A-Za-z0-9]/g, "_");
 }
+
+/* Canonicalise XRD workbook column names for palette/pattern lookup.
+   Workbook headers are user data and are intentionally preserved verbatim in
+   state.xrdCols (and therefore in the legend / tooltips), but mineral styling
+   must not depend on case or harmless punctuation differences. Example:
+   "QUARTZ", "Quartz" and " quartz " all resolve to the canonical
+   "Quartz" pattern. This also fixes legacy lab exports that use all-caps
+   headers such as CHLORITE / KAOLINITE / K-FELDSPAR. */
+function xrdNameKey(name){
+  return String(name == null ? "" : name)
+    .trim()
+    .toLowerCase()
+    .replace(/[\u2010-\u2015\u2212]/g, "-")
+    .replace(/_/g, " ")
+    .replace(/\s*-\s*/g, "-")
+    .replace(/\s+/g, " ");
+}
+const XRD_CANONICAL_BY_KEY = Object.freeze((()=>{
+  const m = {};
+  Object.keys(XRD_COLOR).forEach(n => { m[xrdNameKey(n)] = n; });
+  // Common alternate spellings / separators used by laboratory exports.
+  m["k feldspar"] = "K-feldspar";
+  m["kfeldspar"] = "K-feldspar";
+  m["potassium feldspar"] = "K-feldspar";
+  m["plagioclase feldspar"] = "Plagioclase";
+  return m;
+})());
+function xrdCanonicalName(name){
+  const raw = String(name == null ? "" : name).trim();
+  return XRD_CANONICAL_BY_KEY[xrdNameKey(raw)] || raw;
+}
+function xrdBaseColor(name, idx){
+  const canonical = xrdCanonicalName(name);
+  return XRD_COLOR[canonical] || XRD_FALLBACK[(idx|0) % XRD_FALLBACK.length];
+}
+
 /* Pattern-id resolver used by every XRD render path AND the legend.
    Known mineral → its named pattern; unknown → fallback by column index. */
 function xrdPatternUrl(name, idx){
-  if (Object.prototype.hasOwnProperty.call(XRD_MOTIF, name)){
-    return `url(#xrd-pat-${xrdSafeIdSuffix(name)})`;
+  const canonical = xrdCanonicalName(name);
+  if (Object.prototype.hasOwnProperty.call(XRD_MOTIF, canonical)){
+    return `url(#xrd-pat-${xrdSafeIdSuffix(canonical)})`;
   }
   return `url(#xrd-pat-fb-${(idx|0) % XRD_FALLBACK.length})`;
 }
@@ -13829,8 +13867,9 @@ function renderLegend(){
     // — so the user couldn't tell "Quartz" (crosshatch) apart from
     // "K-feldspar" (vertical lines) when the two colours were close.
     const items = state.xrdCols.map((c,i)=>{
-      const color = XRD_COLOR[c] || XRD_FALLBACK[i%XRD_FALLBACK.length];
-      const safe  = (typeof xrdSafeIdSuffix === "function") ? xrdSafeIdSuffix(c) : c;
+      const canonical = (typeof xrdCanonicalName === "function") ? xrdCanonicalName(c) : c;
+      const color = (typeof xrdBaseColor === "function") ? xrdBaseColor(c, i) : (XRD_COLOR[canonical] || XRD_FALLBACK[i%XRD_FALLBACK.length]);
+      const safe  = (typeof xrdSafeIdSuffix === "function") ? xrdSafeIdSuffix(canonical) : canonical;
       return `<div class="lg-item">
         <svg class="lg-swatch lg-swatch-xrd" viewBox="0 0 96 56" aria-hidden="true">
           <rect width="96" height="56" fill="${color}"/>
@@ -14535,8 +14574,9 @@ function buildLegendForExport(svgWidth){
   // user sees on the XRD track. Mineral name is translated.
   if (vis("xrd") && state.xrd && state.xrd.length && state.xrdCols && state.xrdCols.length){
     const items = state.xrdCols.map((c,i) => {
-      const color = XRD_COLOR[c] || XRD_FALLBACK[i % XRD_FALLBACK.length];
-      const safe = (typeof xrdSafeIdSuffix === "function") ? xrdSafeIdSuffix(c) : c;
+      const canonical = (typeof xrdCanonicalName === "function") ? xrdCanonicalName(c) : c;
+      const color = (typeof xrdBaseColor === "function") ? xrdBaseColor(c, i) : (XRD_COLOR[canonical] || XRD_FALLBACK[i % XRD_FALLBACK.length]);
+      const safe = (typeof xrdSafeIdSuffix === "function") ? xrdSafeIdSuffix(canonical) : canonical;
       const sw = `<rect width="48" height="24" fill="${color}"/>`
                + `<rect width="48" height="24" fill="url(#xrd-pat-${safe})"/>`
                + `<rect width="48" height="24" fill="none" stroke="var(--struct-ink,#1F2328)" stroke-width="0.5"/>`;
@@ -15169,6 +15209,94 @@ document.getElementById("btnExportSvg").addEventListener("click", async ()=>{
     // Colour for the background rect — must be a literal, not var(--...).
     const bgColor = cssVar("--bg-log");
 
+    /* Standalone-SVG photo lightbox. Event listeners attached with
+       addEventListener() in the HTML app are not serialised by XMLSerializer,
+       so an exported SVG would otherwise contain the pixels but lose the
+       click-to-preview behaviour. Embed one SVG-native overlay plus a tiny
+       script that delegates clicks from any [data-file] element. The script
+       reuses the already-inlined image href (no duplicate base64 payload).
+
+       The overlay is fitted to the CURRENT browser viewport in SVG user
+       coordinates using getScreenCTM().inverse(), so it appears where the
+       user clicked even on a very tall log that has been scrolled thousands
+       of pixels down. Static/vector editors that do not execute SVG scripts
+       simply ignore the interaction; the drawing itself remains valid. */
+    const svgPhotoLightbox = (() => {
+      const closeLabel = state.lang === "ru" ? "Закрыть" : "Close";
+      const script = `<![CDATA[
+(function(){
+  var root=document.documentElement, box=document.getElementById('clv-svg-photo-lightbox');
+  if(!root||!box) return;
+  var shade=document.getElementById('clv-svg-photo-shade');
+  var panel=document.getElementById('clv-svg-photo-panel');
+  var pic=document.getElementById('clv-svg-photo-big');
+  var cap=document.getElementById('clv-svg-photo-cap');
+  var close=document.getElementById('clv-svg-photo-close');
+  var title=document.getElementById('clv-svg-photo-close-label');
+  function svgPoint(cx,cy){
+    var p=root.createSVGPoint(); p.x=cx; p.y=cy;
+    var m=root.getScreenCTM();
+    return m ? p.matrixTransform(m.inverse()) : {x:cx,y:cy};
+  }
+  function viewportBox(){
+    var a=svgPoint(0,0), b=svgPoint(window.innerWidth||root.clientWidth,window.innerHeight||root.clientHeight);
+    return {x:Math.min(a.x,b.x),y:Math.min(a.y,b.y),w:Math.abs(b.x-a.x),h:Math.abs(b.y-a.y)};
+  }
+  function findSource(file,clicked){
+    if(clicked && clicked.tagName && clicked.tagName.toLowerCase()==='image'){
+      var par=clicked.parentNode;
+      if(!(par && par.classList && par.classList.contains('photo-clip-overlay'))){
+        var h=clicked.getAttribute('href')||clicked.getAttributeNS('http://www.w3.org/1999/xlink','href');
+        if(h) return h;
+      }
+    }
+    var imgs=root.querySelectorAll('g.bdy image[data-file]');
+    for(var i=0;i<imgs.length;i++){
+      if(imgs[i].getAttribute('data-file')!==file) continue;
+      var p=imgs[i].parentNode;
+      if(p && p.classList && p.classList.contains('photo-clip-overlay')) continue;
+      var h2=imgs[i].getAttribute('href')||imgs[i].getAttributeNS('http://www.w3.org/1999/xlink','href');
+      if(h2) return h2;
+    }
+    return '';
+  }
+  function hide(){ box.setAttribute('display','none'); pic.removeAttribute('href'); }
+  function show(node){
+    var file=node.getAttribute('data-file')||'', href=findSource(file,node);
+    if(!href) return;
+    var v=viewportBox(), pad=Math.max(8,Math.min(v.w,v.h)*0.025);
+    shade.setAttribute('x',v.x); shade.setAttribute('y',v.y); shade.setAttribute('width',v.w); shade.setAttribute('height',v.h);
+    panel.setAttribute('x',v.x+pad); panel.setAttribute('y',v.y+pad); panel.setAttribute('width',Math.max(1,v.w-2*pad)); panel.setAttribute('height',Math.max(1,v.h-2*pad));
+    var capH=Math.max(22,Math.min(42,v.h*0.08));
+    pic.setAttribute('x',v.x+2*pad); pic.setAttribute('y',v.y+2*pad); pic.setAttribute('width',Math.max(1,v.w-4*pad)); pic.setAttribute('height',Math.max(1,v.h-4*pad-capH)); pic.setAttribute('href',href);
+    close.setAttribute('cx',v.x+v.w-2*pad); close.setAttribute('cy',v.y+2*pad); close.setAttribute('r',Math.max(9,Math.min(16,Math.min(v.w,v.h)*0.025)));
+    title.setAttribute('x',v.x+v.w-2*pad); title.setAttribute('y',v.y+2*pad+4);
+    cap.setAttribute('x',v.x+v.w/2); cap.setAttribute('y',v.y+v.h-pad-Math.max(6,capH*0.2));
+    cap.textContent=(file+(node.getAttribute('data-cap')?' · '+node.getAttribute('data-cap'):''));
+    box.setAttribute('display','inline');
+  }
+  root.addEventListener('click',function(e){
+    if(box.getAttribute('display')!=='none'){
+      if(e.target===shade || e.target===panel || e.target===close || e.target===title){ e.preventDefault(); e.stopPropagation(); hide(); }
+      return;
+    }
+    var n=e.target;
+    while(n && n!==root && !(n.getAttribute && n.hasAttribute('data-file'))) n=n.parentNode;
+    if(n && n!==root && n.getAttribute && n.hasAttribute('data-file')){ e.preventDefault(); e.stopPropagation(); show(n); }
+  },false);
+  document.addEventListener('keydown',function(e){ if(e.key==='Escape' || e.keyCode===27) hide(); },false);
+})();
+]]>`;
+      return `<g id="clv-svg-photo-lightbox" display="none" style="cursor:default">`
+           + `<rect id="clv-svg-photo-shade" fill="#000" fill-opacity="0.82"/>`
+           + `<rect id="clv-svg-photo-panel" fill="#111" fill-opacity="0.96" stroke="#fff" stroke-opacity="0.32" stroke-width="1" rx="4"/>`
+           + `<image id="clv-svg-photo-big" preserveAspectRatio="xMidYMid meet"/>`
+           + `<text id="clv-svg-photo-cap" text-anchor="middle" fill="#fff" font-family="'IBM Plex Sans',system-ui,sans-serif" font-size="13"> </text>`
+           + `<circle id="clv-svg-photo-close" fill="#000" fill-opacity="0.72" stroke="#fff" stroke-width="1.2" style="cursor:pointer"/>`
+           + `<text id="clv-svg-photo-close-label" text-anchor="middle" fill="#fff" font-family="'IBM Plex Sans',system-ui,sans-serif" font-size="11" font-weight="600" pointer-events="none">×</text>`
+           + `<title>${esc(closeLabel)}</title></g><script type="application/ecmascript">${script}</script>`;
+    })();
+
     const combined =
       `<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n` +
       `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" ` +
@@ -15204,6 +15332,7 @@ document.getElementById("btnExportSvg").addEventListener("click", async ()=>{
         (legend.svg
           ? `<g class="legend" transform="translate(0,${wellBanner.height + h1 + h2})">${legend.svg}</g>`
           : "") +
+        svgPhotoLightbox +
       `</svg>`;
 
     // Validate that the SVG reparses cleanly — catch bugs before the user does.
