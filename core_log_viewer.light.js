@@ -2,7 +2,7 @@
    Contains: FGDC lithology pattern data + main viewer application
    (all patterns and heavy computation live here, per the HTML/JS split). */
 
-const APP_VERSION = "v1.2.5";
+const APP_VERSION = "v1.2.6";
 const APP_BUILD_DATE = "2026-09-03";
 if (typeof window !== "undefined") window.CORE_LOG_VIEWER_VERSION = APP_VERSION;
 
@@ -15260,6 +15260,28 @@ document.getElementById("btnExportSvg").addEventListener("click", async ()=>{
     var vh=(vv && vv.height) || window.innerHeight || 1;
     return {left:0,top:0,right:Math.max(1,vw),bottom:Math.max(1,vh)};
   }
+  function syncRootCanvas(){
+    /* Standalone SVG scrolling must remain ordinary browser/document
+       scrolling. Keep SVG user units 1:1 with CSS pixels and only enlarge
+       the root canvas horizontally when the browser is wider than the log.
+       Updating BOTH rendered width and viewBox width prevents the log from
+       being stretched while still giving the fullscreen photo lightbox the
+       whole visible window. A tall root retains its real document height,
+       so wheel/trackpad/page scrolling works normally. */
+    var baseW=parseFloat(root.getAttribute('data-clv-base-width')) || 1;
+    var baseH=parseFloat(root.getAttribute('data-clv-base-height')) || 1;
+    var vp=browserViewport();
+    var vw=Math.max(1,vp.right-vp.left);
+    var drawW=Math.max(baseW,Math.ceil(vw));
+    root.setAttribute('width',String(drawW));
+    root.setAttribute('height',String(baseH));
+    root.setAttribute('viewBox','0 0 '+drawW+' '+baseH);
+    root.style.width=drawW+'px';
+    root.style.height=baseH+'px';
+    root.style.minWidth='0';
+    root.style.maxWidth='none';
+    root.style.overflow='visible';
+  }
   function viewportBox(){
     var vp=browserViewport();
     var rr=root.getBoundingClientRect();
@@ -15366,11 +15388,13 @@ document.getElementById("btnExportSvg").addEventListener("click", async ()=>{
   /* Keep the lightbox locked to the visible browser window. This matters
      for a tall exported log: resize, orientation changes and scrolling can
      all change the viewport while the preview is open. */
-  window.addEventListener('resize',layout,false);
-  window.addEventListener('orientationchange',layout,false);
+  function syncAndLayout(){ syncRootCanvas(); layout(); }
+  syncRootCanvas();
+  window.addEventListener('resize',syncAndLayout,false);
+  window.addEventListener('orientationchange',syncAndLayout,false);
   window.addEventListener('scroll',layout,false);
   if(window.visualViewport){
-    window.visualViewport.addEventListener('resize',layout,false);
+    window.visualViewport.addEventListener('resize',syncAndLayout,false);
     window.visualViewport.addEventListener('scroll',layout,false);
   }
 })();
@@ -15389,7 +15413,8 @@ document.getElementById("btnExportSvg").addEventListener("click", async ()=>{
       `<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n` +
       `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" ` +
         `width="${w}" height="${totalH}" viewBox="0 0 ${w} ${totalH}" preserveAspectRatio="xMinYMin meet" ` +
-        `style="display:block;width:100vw;min-width:${w}px;height:${totalH}px;overflow:hidden" ` +
+        `data-clv-base-width="${w}" data-clv-base-height="${totalH}" ` +
+        `style="display:block;width:${w}px;height:${totalH}px;max-width:none;overflow:visible" ` +
         `font-family="'IBM Plex Sans',system-ui,sans-serif">` +
         `<style type="text/css"><![CDATA[${buildExportStyles()}]]></style>` +
         // Emit the shared defs block at the ROOT of the export SVG.
@@ -15492,7 +15517,8 @@ document.getElementById("btnExportSvg").addEventListener("click", async ()=>{
      A4: 210 × 297 mm  (most common deliverable)
      A3: 297 × 420 mm  (larger format for very wide logs)
    Both at print-grade 200 DPI raster (≈8 px/mm) — sharp on screen,
-   sharp in print at 100%, file size stays manageable. */
+   sharp in print at 100%, file size stays manageable. Vector decoding is
+   chunked across adjacent pages so large stitched logs export much faster. */
 
 const PDF_PAGE_SIZES = {
   // mm dimensions, portrait orientation
@@ -15501,6 +15527,8 @@ const PDF_PAGE_SIZES = {
 };
 const PDF_DPI       = 200;  // raster density — 200 DPI is a good
                             // balance between sharpness and file size
+const PDF_MAX_VECTOR_CHUNK_PIXELS = 16000000; // ~64 MB RGBA decode target
+const PDF_MAX_VECTOR_CHUNK_PAGES  = 4;        // A4≈4 pages, A3≈2 per decode
 
 async function exportLogAsPdf(pageSizeKey){
   const ps = PDF_PAGE_SIZES[pageSizeKey];
@@ -15637,21 +15665,33 @@ async function exportLogAsPdf(pageSizeKey){
     // as SVG export — keeps file size sane for logs with many core
     // photos. External http(s) images are left as URLs so the browser
     // fetches them when the SVG rasterises.
-    const allImages = bdyClone.querySelectorAll("image");
-    for (const imgEl of allImages){
+    const allImages = Array.from(bdyClone.querySelectorAll("image"));
+    const imageJobs = allImages.filter(imgEl => {
       const parent = imgEl.parentElement;
-      if (parent && parent.classList && parent.classList.contains("photo-clip-overlay")) continue;
-      let href = imgEl.getAttribute("href") || imgEl.getAttributeNS("http://www.w3.org/1999/xlink", "href");
-      if (!href) continue;
-      if (!href.startsWith("blob:") && !href.startsWith("data:")) continue;
-      try {
-        const dataUrl = await blobUrlToCompressedDataUrl(href, 1200, 0.78);
-        imgEl.setAttribute("href", dataUrl);
-        imgEl.removeAttributeNS("http://www.w3.org/1999/xlink", "href");
-      } catch (err){
-        console.warn("PDF: failed to inline image:", href.slice(0, 80), err);
+      if (parent && parent.classList && parent.classList.contains("photo-clip-overlay")) return false;
+      const href = imgEl.getAttribute("href") || imgEl.getAttributeNS("http://www.w3.org/1999/xlink", "href");
+      return !!href && (href.startsWith("blob:") || href.startsWith("data:"));
+    });
+    // Decode/compress a few photos in parallel. The old serial loop could
+    // dominate PDF startup time on photo-heavy logs; three workers is a
+    // conservative balance between speed and memory use.
+    let imageJobNext = 0;
+    const imageWorker = async () => {
+      while (true){
+        const idx = imageJobNext++;
+        if (idx >= imageJobs.length) return;
+        const imgEl = imageJobs[idx];
+        const href = imgEl.getAttribute("href") || imgEl.getAttributeNS("http://www.w3.org/1999/xlink", "href");
+        try {
+          const dataUrl = await blobUrlToCompressedDataUrl(href, 1200, 0.78);
+          imgEl.setAttribute("href", dataUrl);
+          imgEl.removeAttributeNS("http://www.w3.org/1999/xlink", "href");
+        } catch (err){
+          console.warn("PDF: failed to inline image:", href.slice(0, 80), err);
+        }
       }
-    }
+    };
+    await Promise.all(Array.from({length:Math.min(3, Math.max(1,imageJobs.length))}, () => imageWorker()));
 
     // Remove the clone-local <defs> blocks before composing PDF page SVGs.
     // renderHeader/renderBody each carry their own defs for the live view, but
@@ -15746,12 +15786,24 @@ async function exportLogAsPdf(pageSizeKey){
     const canvas = document.createElement("canvas");
     const ctx = canvas.getContext("2d", { alpha:false });
 
-    // Rasterise ONE page slice directly from SVG vector coordinates at final
-    // print resolution. This replaces the old "one huge SVG image -> crop ->
-    // JPEG" path. Fine XRD dots/hatches are therefore resolved at PDF DPI and
-    // are stored losslessly rather than being altered by JPEG ringing/moire.
-    const renderSvgSliceToPng = async (content, fullW, fullH, srcY, srcH, destW, destH) => {
-      const sliceSvg =
+    /* Fast vector raster path.
+       v1.2.5 created + parsed + decoded a complete SVG document separately
+       for EVERY PDF page. defsSvg() is large (FGDC/GOST/core-description/XRD
+       definitions), so repeating that work was unnecessarily expensive.
+
+       Here we decode a small run of adjacent physical pages as ONE SVG image
+       at final print resolution, then crop each page from that decoded vector
+       chunk. XRD patterns still pass through the native SVG renderer at
+       PDF_DPI and pages are still stored losslessly; only duplicated parsing/
+       decoding work is removed. Chunk size is bounded by a pixel budget so
+       A3 exports do not create excessive temporary bitmaps. */
+    const vectorPagesPerChunk = Math.max(1, Math.min(
+      PDF_MAX_VECTOR_CHUNK_PAGES,
+      Math.floor(PDF_MAX_VECTOR_CHUNK_PIXELS / Math.max(1, pageW_px * pageH_px))
+    ));
+
+    const loadVectorChunk = async (content, fullW, srcY, srcH, destW, destH) => {
+      const chunkSvg =
         `<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n` +
         `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" ` +
           `width="${destW}" height="${destH}" viewBox="0 ${srcY} ${fullW} ${srcH}" ` +
@@ -15760,70 +15812,77 @@ async function exportLogAsPdf(pageSizeKey){
           content +
         `</svg>`;
 
-      // Validate generated XML before handing it to the image decoder.
-      const parsed = new DOMParser().parseFromString(sliceSvg, "image/svg+xml");
-      const perr = parsed.querySelector("parsererror");
-      if (perr){
-        const msg = (perr.textContent || "SVG parse error").replace(/\s+/g," ").trim().slice(0,220);
-        throw new Error("PDF page SVG does not parse: " + msg);
-      }
-
-      const url = URL.createObjectURL(new Blob([sliceSvg], {type:"image/svg+xml;charset=utf-8"}));
+      const url = URL.createObjectURL(new Blob([chunkSvg], {type:"image/svg+xml;charset=utf-8"}));
       try {
         const img = await new Promise((resolve, reject) => {
           const im = new Image();
           im.onload = () => resolve(im);
-          im.onerror = () => reject(new Error("Failed to rasterise PDF page SVG"));
+          im.onerror = () => reject(new Error("Failed to rasterise PDF vector chunk"));
           im.src = url;
         });
-        canvas.width = destW;
-        canvas.height = destH;
-        ctx.fillStyle = "#FFFFFF";
-        ctx.fillRect(0, 0, destW, destH);
-        // Four-argument drawImage lets the browser rasterise the vector SVG at
-        // the destination resolution. We never crop a pre-rasterised tall image.
-        ctx.drawImage(img, 0, 0, destW, destH);
-        return canvas.toDataURL("image/png");
-      } finally {
+        return {img, url};
+      } catch (err){
         URL.revokeObjectURL(url);
+        throw err;
+      }
+    };
+
+    let emittedPages = 0;
+    const emitPagedVectorSource = async (content, fullW, fullH, srcPerPage, pageCount) => {
+      for (let chunkStartPage = 0; chunkStartPage < pageCount; chunkStartPage += vectorPagesPerChunk){
+        const chunkEndPage = Math.min(pageCount, chunkStartPage + vectorPagesPerChunk);
+        const chunkSrcY = chunkStartPage * srcPerPage;
+        const chunkSrcEnd = Math.min(fullH, chunkEndPage * srcPerPage);
+        const chunkSrcH = Math.max(1e-9, chunkSrcEnd - chunkSrcY);
+        const chunkDestH = Math.max(1, Math.round(pageW_px * chunkSrcH / fullW));
+
+        const loaded = await loadVectorChunk(content, fullW, chunkSrcY, chunkSrcH, pageW_px, chunkDestH);
+        try {
+          const img = loaded.img;
+          const syScale = img.naturalHeight / chunkSrcH;
+
+          for (let p = chunkStartPage; p < chunkEndPage; p++){
+            const srcY = p * srcPerPage;
+            const srcH = Math.min(srcPerPage, fullH - srcY);
+            const isFullPage = p < pageCount - 1 || srcH >= srcPerPage - 1e-7;
+            const destH = isFullPage
+              ? pageH_px
+              : Math.max(1, Math.round(pageW_px * srcH / fullW));
+
+            canvas.width = pageW_px;
+            canvas.height = destH;
+            ctx.fillStyle = "#FFFFFF";
+            ctx.fillRect(0, 0, pageW_px, destH);
+
+            // Source crop is expressed in decoded-chunk pixels. Floating-point
+            // crop coordinates deliberately preserve exact adjacent boundaries;
+            // there is no one-pixel overlap/gap introduced by integer rounding.
+            const sy = (srcY - chunkSrcY) * syScale;
+            const sh = srcH * syScale;
+            ctx.drawImage(img, 0, sy, img.naturalWidth, sh, 0, 0, pageW_px, destH);
+
+            if (emittedPages > 0) pdf.addPage(pageSizeKey, orientation);
+            const usedH_mm = isFullPage ? pageH_mm : (srcH * pageW_mm / fullW);
+            // Pass the canvas directly. This avoids constructing a large base64
+            // data URL in our code; jsPDF copies the image synchronously here.
+            pdf.addImage(canvas, "PNG", 0, 0, pageW_mm, usedH_mm, undefined, "FAST");
+            emittedPages++;
+          }
+        } finally {
+          URL.revokeObjectURL(loaded.url);
+        }
       }
     };
 
     // ---- Continuous stitched log pages ----
-    for (let p = 0; p < logPageCount; p++){
-      const srcY = p * logSrcPerPage;
-      const srcH = Math.min(logSrcPerPage, logH - srcY);
-      const isFullPage = p < logPageCount - 1 || srcH >= logSrcPerPage - 1e-7;
-      const destH = isFullPage
-        ? pageH_px
-        : Math.max(1, Math.round(pageW_px * srcH / w));
-
-      const dataUrl = await renderSvgSliceToPng(logContent, w, logH, srcY, srcH, pageW_px, destH);
-      if (p > 0) pdf.addPage(pageSizeKey, orientation);
-
-      // Full pages touch all four PDF edges. Last partial page keeps the same
-      // physical vertical scale and simply ends where the log ends.
-      const usedH_mm = isFullPage ? pageH_mm : (srcH * pageW_mm / w);
-      pdf.addImage(dataUrl, "PNG", 0, 0, pageW_mm, usedH_mm, undefined, "FAST");
-    }
+    await emitPagedVectorSource(logContent, w, logH, logSrcPerPage, logPageCount);
 
     // ---- Legend page(s), also without generated page furniture ----
     if (legendContent){
-      for (let p = 0; p < legendPageCount; p++){
-        const srcY = p * legendSrcPerPage;
-        const srcH = Math.min(legendSrcPerPage, legend.height - srcY);
-        const isFullPage = p < legendPageCount - 1 || srcH >= legendSrcPerPage - 1e-7;
-        const destH = isFullPage
-          ? pageH_px
-          : Math.max(1, Math.round(pageW_px * srcH / legendNaturalWidth));
-        const dataUrl = await renderSvgSliceToPng(
-          legendContent, legendNaturalWidth, legend.height,
-          srcY, srcH, pageW_px, destH
-        );
-        pdf.addPage(pageSizeKey, orientation);
-        const usedH_mm = isFullPage ? pageH_mm : (srcH * pageW_mm / legendNaturalWidth);
-        pdf.addImage(dataUrl, "PNG", 0, 0, pageW_mm, usedH_mm, undefined, "FAST");
-      }
+      await emitPagedVectorSource(
+        legendContent, legendNaturalWidth, legend.height,
+        legendSrcPerPage, legendPageCount
+      );
     }
 
     const wi = state.wellInfo || {};
