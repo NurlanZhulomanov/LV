@@ -2,8 +2,8 @@
    Contains: FGDC lithology pattern data + main viewer application
    (all patterns and heavy computation live here, per the HTML/JS split). */
 
-const APP_VERSION = "v1.2.0";
-const APP_BUILD_DATE = "2026-08-12";
+const APP_VERSION = "v1.2.1";
+const APP_BUILD_DATE = "2026-09-03";
 if (typeof window !== "undefined") window.CORE_LOG_VIEWER_VERSION = APP_VERSION;
 
 /* ===== FGDC pattern data ===== */
@@ -6885,6 +6885,11 @@ const state = {
                   boundaries — useful when the user wants exact
                   rectangle boundaries to read individual sample %s) */
   trackMode: { xrd: "stream", sat: "stream" },
+  /* Optional user overrides for track HEADER text. Kept separate from
+     TRACK_DEFS so the frozen track registry remains immutable. Currently
+     the Core photo header is editable by clicking its title; blank restores
+     the built-in label. This object is part of session/autosave snapshots. */
+  trackTitles: { photo: "" },
   /* Coring-gap depth-axis behaviour. Two modes:
        "real"     — every gap renders at its true depth extent (a 100 m
                     gap takes 100 m of vertical pixels). Honest but
@@ -9002,18 +9007,32 @@ function renderHeader(){
        y 62–74    tick labels
   */
 
-  // ----- helper: wrap label into [line1, line2]. Prefers explicit td.label[]; otherwise splits on space. -----
+  // ----- helper: wrap label into [line1, line2]. A user header override
+  //       takes precedence over TRACK_DEFS.label/name and is shown verbatim
+  //       (not translated), because it is project-specific text. -----
   const CHAR_PX = 5.6; // approx width of 10px mono chars
   const wrapLabel = (td) => {
-    if (Array.isArray(td.label)){
+    const custom = state.trackTitles && typeof state.trackTitles[td.id] === "string"
+      ? state.trackTitles[td.id].trim()
+      : "";
+    if (!custom && Array.isArray(td.label)){
       // Look up the joined-label translation if available
       return tLabelArr(td.label);
     }
-    const name = t(td.name);          // translate full track name
+    const name = custom || t(td.name);
     if (name.length * CHAR_PX <= td.w - 6) return [name];
-    // Try space-split
-    const sp = name.indexOf(" ");
-    if (sp > 0) return [name.slice(0, sp), name.slice(sp+1)];
+
+    // Split near the visual middle, preferring a word boundary. This is
+    // friendlier for custom names such as "Mud core photo" than always
+    // breaking at the first space.
+    const spaces = [];
+    for (let i = 0; i < name.length; i++) if (name[i] === " ") spaces.push(i);
+    if (spaces.length){
+      const target = name.length / 2;
+      const sp = spaces.reduce((best, pos) =>
+        Math.abs(pos - target) < Math.abs(best - target) ? pos : best, spaces[0]);
+      return [name.slice(0, sp).trim(), name.slice(sp + 1).trim()];
+    }
     // Else break at ~half
     const half = Math.ceil(name.length/2);
     return [name.slice(0, half), name.slice(half)];
@@ -9029,14 +9048,19 @@ function renderHeader(){
     // vertical separator
     out += `<line x1="${lay.x}" y1="0" x2="${lay.x}" y2="${HEADER_H}" class="track-rule"/>`;
 
-    // title (1 or 2 lines)
+    // title (1 or 2 lines). Core photo is project-renamable without any
+    // HTML changes: click either title line to edit; blank resets default.
     const lines = wrapLabel(td);
     const cx = lay.x + lay.w/2;
+    const editableTitle = td.id === "photo";
+    const titleAttrs = editableTitle
+      ? ` data-track-title="photo" style="cursor:pointer" title="${esc(state.lang === "ru" ? "Клик: изменить заголовок колонки" : "Click to rename track header")}"`
+      : "";
     if (lines.length === 1){
-      out += `<text x="${cx}" y="24" class="track-name" text-anchor="middle">${esc(lines[0])}</text>`;
+      out += `<text x="${cx}" y="24" class="track-name" text-anchor="middle"${titleAttrs}>${esc(lines[0])}</text>`;
     } else {
-      out += `<text x="${cx}" y="18" class="track-name" text-anchor="middle">${esc(lines[0])}</text>`;
-      out += `<text x="${cx}" y="30" class="track-name" text-anchor="middle">${esc(lines[1])}</text>`;
+      out += `<text x="${cx}" y="18" class="track-name" text-anchor="middle"${titleAttrs}>${esc(lines[0])}</text>`;
+      out += `<text x="${cx}" y="30" class="track-name" text-anchor="middle"${titleAttrs}>${esc(lines[1])}</text>`;
     }
     if (td.unit){
       // Depth track shows the live depth unit (m / ft) — not the
@@ -9448,12 +9472,38 @@ function _bindGammaMaxEditor(svg){
     const tsMaxEl = e.target.closest("[data-ts-max]");
     const tsMinEl = e.target.closest("[data-ts-min]");
     const grMinEl = e.target.closest("[data-gr-min]");
-    if (!grEl && !sgrEl && !sgrMinEl && !sgrApiMinEl && !sgrApiMaxEl && !tsMaxEl && !tsMinEl && !grMinEl) return;
+    const titleEl = e.target.closest("[data-track-title]");
+    if (!grEl && !sgrEl && !sgrMinEl && !sgrApiMinEl && !sgrApiMaxEl && !tsMaxEl && !tsMinEl && !grMinEl && !titleEl) return;
     const ru = state.lang === "ru";
     const done = () => {
       render();
       if (typeof Autosave !== "undefined" && Autosave.trigger) Autosave.trigger();
     };
+
+    // ---- Editable track header text (currently Core photo) ----
+    if (titleEl){
+      const id = titleEl.dataset.trackTitle;
+      if (id !== "photo") return;
+      if (!state.trackTitles || typeof state.trackTitles !== "object") state.trackTitles = {};
+      const cur = String(state.trackTitles[id] || "");
+      _scalePrompt(
+        titleEl,
+        ru
+          ? "Заголовок колонки фото. Пусто = «Фото керна»:"
+          : "Photo track header. Blank = “Core photo”:",
+        cur || (ru ? "Фото керна" : "Core photo"),
+        ans => {
+          let raw = String(ans == null ? "" : ans).trim();
+          // Treat either language's built-in default as a reset rather than
+          // storing a redundant override; cap length to keep headers sane.
+          if (raw === "Core photo" || raw === "Фото керна") raw = "";
+          state.trackTitles[id] = raw.slice(0, 80);
+          done();
+        }
+      );
+      return;
+    }
+
     // ---- Generic per-track adjustable scale (min + max) ----
     if (tsMaxEl || tsMinEl){
       const isMax = !!tsMaxEl;
@@ -15137,11 +15187,20 @@ document.getElementById("btnExportSvg").addEventListener("click", async ()=>{
         // intermittently exported as flat-colour rectangles.
         defsSvg() +
         `<rect width="100%" height="100%" fill="${bgColor}"/>` +
+        // The live body is a nested <svg>, so its viewport clips any
+        // geometry that extends a few pixels beyond y=0 / y=height. XRD
+        // deliberately mirrors first/last sample spacing and can create
+        // such geometry. During standalone export we strip the nested <svg>
+        // wrapper and place its children in a <g>; without an explicit clip
+        // the XRD column becomes visible above/below the body. Recreate the
+        // original viewport clip at the export root so exported appearance
+        // exactly matches the on-screen log without modifying XRD data.
+        `<defs><clipPath id="clv-export-body-clip" clipPathUnits="userSpaceOnUse"><rect x="0" y="0" width="${w}" height="${h2}"/></clipPath></defs>` +
         (wellBanner.svg
           ? `<g class="well-banner">${wellBanner.svg}</g>`
           : "") +
         `<g class="hdr" transform="translate(0,${wellBanner.height})">${innerOf(hdrClone)}</g>` +
-        `<g class="bdy" transform="translate(0,${wellBanner.height + h1})">${innerOf(bdyClone)}</g>` +
+        `<g class="bdy" transform="translate(0,${wellBanner.height + h1})" clip-path="url(#clv-export-body-clip)">${innerOf(bdyClone)}</g>` +
         (legend.svg
           ? `<g class="legend" transform="translate(0,${wellBanner.height + h1 + h2})">${legend.svg}</g>`
           : "") +
