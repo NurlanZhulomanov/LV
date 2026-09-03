@@ -2,7 +2,7 @@
    Contains: FGDC lithology pattern data + main viewer application
    (all patterns and heavy computation live here, per the HTML/JS split). */
 
-const APP_VERSION = "v1.2.2";
+const APP_VERSION = "v1.2.5";
 const APP_BUILD_DATE = "2026-09-03";
 if (typeof window !== "undefined") window.CORE_LOG_VIEWER_VERSION = APP_VERSION;
 
@@ -6266,7 +6266,7 @@ function xrdPatternUrl(name, idx){
 
    Our XRD motifs are authored against small native grids (8 / 12 units)
    whose repeating elements sit ~1.5–3 units apart (see xrdMotifPitch).
-   We pick a per-motif patternTransform scale = XRD_TARGET_PITCH_PX /
+   We pick a per-motif geometry scale = XRD_TARGET_PITCH_PX /
    nativePitch so EVERY motif — dots, stripes, bricks, rhombi, hatch —
    renders at the same ~3.7 px feature pitch, matching the lithology
    stipple. (A first attempt scaled each whole tile to 64 px, which blew
@@ -6282,20 +6282,31 @@ function xrdAllPatternsSvg(){
     const [tw, th] = xrdMotifTile(motif);
     const scale = (XRD_TARGET_PITCH_PX / xrdMotifPitch(motif));
     const sf = scale.toFixed(4);
-    out += `<pattern id="xrd-pat-${xrdSafeIdSuffix(name)}" width="${tw}" height="${th}" patternUnits="userSpaceOnUse" patternTransform="scale(${sf})">`
+    const pw = (tw * scale).toFixed(4);
+    const ph = (th * scale).toFixed(4);
+    // PDF/SVG-rasteriser-safe form: bake patternTransform into the tile
+    // dimensions and transform only the pattern contents. Visually this is
+    // equivalent to patternTransform="scale(...)" but avoids a long-standing
+    // source of inconsistent pattern rendering when an SVG is itself loaded
+    // as an <image> and rasterised to canvas (the PDF export path).
+    out += `<pattern id="xrd-pat-${xrdSafeIdSuffix(name)}" width="${pw}" height="${ph}" patternUnits="userSpaceOnUse">`
+         + `<g transform="scale(${sf})">`
          + `<rect width="${tw}" height="${th}" fill="${base}"/>`
          + xrdMotifInner(motif, base, scale)
-         + `</pattern>`;
+         + `</g></pattern>`;
   }
   XRD_FALLBACK.forEach((base, i) => {
     const motif = XRD_FALLBACK_MOTIFS[i % XRD_FALLBACK_MOTIFS.length];
     const [tw, th] = xrdMotifTile(motif);
     const scale = (XRD_TARGET_PITCH_PX / xrdMotifPitch(motif));
     const sf = scale.toFixed(4);
-    out += `<pattern id="xrd-pat-fb-${i}" width="${tw}" height="${th}" patternUnits="userSpaceOnUse" patternTransform="scale(${sf})">`
+    const pw = (tw * scale).toFixed(4);
+    const ph = (th * scale).toFixed(4);
+    out += `<pattern id="xrd-pat-fb-${i}" width="${pw}" height="${ph}" patternUnits="userSpaceOnUse">`
+         + `<g transform="scale(${sf})">`
          + `<rect width="${tw}" height="${th}" fill="${base}"/>`
          + xrdMotifInner(motif, base, scale)
-         + `</pattern>`;
+         + `</g></pattern>`;
   });
   return out;
 }
@@ -15233,14 +15244,45 @@ document.getElementById("btnExportSvg").addEventListener("click", async ()=>{
   var cap=document.getElementById('clv-svg-photo-cap');
   var close=document.getElementById('clv-svg-photo-close');
   var title=document.getElementById('clv-svg-photo-close-label');
+  var activeNode=null, activeHref='';
+
   function svgPoint(cx,cy){
     var p=root.createSVGPoint(); p.x=cx; p.y=cy;
     var m=root.getScreenCTM();
     return m ? p.matrixTransform(m.inverse()) : {x:cx,y:cy};
   }
+  function browserViewport(){
+    /* Use the genuinely visible browser viewport. visualViewport avoids
+       overestimating the usable area under browser zoom; desktop falls
+       back to innerWidth/innerHeight. Coordinates here are client coords. */
+    var vv=window.visualViewport;
+    var vw=(vv && vv.width)  || window.innerWidth  || 1;
+    var vh=(vv && vv.height) || window.innerHeight || 1;
+    return {left:0,top:0,right:Math.max(1,vw),bottom:Math.max(1,vh)};
+  }
   function viewportBox(){
-    var a=svgPoint(0,0), b=svgPoint(window.innerWidth||root.clientWidth,window.innerHeight||root.clientHeight);
-    return {x:Math.min(a.x,b.x),y:Math.min(a.y,b.y),w:Math.abs(b.x-a.x),h:Math.abs(b.y-a.y)};
+    var vp=browserViewport();
+    var rr=root.getBoundingClientRect();
+
+    /* The exported SVG root is CSS-sized to at least the browser width
+       (see the root style emitted below), but use its REAL rendered bounds
+       as a final safety clamp. This is the critical ultra-wide fix: neither
+       the photo rectangle nor the close button can be laid out in coordinates
+       that the root SVG would clip. */
+    var l=Math.max(vp.left,rr.left);
+    var t=Math.max(vp.top,rr.top);
+    var r=Math.min(vp.right,rr.right);
+    var b=Math.min(vp.bottom,rr.bottom);
+    if(!(r>l)){ l=vp.left; r=vp.right; }
+    if(!(b>t)){ t=vp.top; b=vp.bottom; }
+
+    var a=svgPoint(l,t), z=svgPoint(r,b);
+    return {
+      x:Math.min(a.x,z.x),
+      y:Math.min(a.y,z.y),
+      w:Math.max(1,Math.abs(z.x-a.x)),
+      h:Math.max(1,Math.abs(z.y-a.y))
+    };
   }
   function findSource(file,clicked){
     if(clicked && clicked.tagName && clicked.tagName.toLowerCase()==='image'){
@@ -15260,36 +15302,82 @@ document.getElementById("btnExportSvg").addEventListener("click", async ()=>{
     }
     return '';
   }
-  function hide(){ box.setAttribute('display','none'); pic.removeAttribute('href'); }
+  function layout(){
+    if(box.getAttribute('display')==='none') return;
+    var v=viewportBox();
+    /* Use essentially the whole browser viewport. The photo itself keeps
+       its native aspect ratio via preserveAspectRatio="xMidYMid meet";
+       therefore portrait and landscape images both grow to the largest
+       size that fits the CURRENT window without stretching or cropping. */
+    var minSide=Math.min(v.w,v.h);
+    var pad=Math.max(4,Math.min(12,minSide*0.012));
+    var caption=(cap.textContent||'').trim();
+    var capH=caption ? Math.max(20,Math.min(30,v.h*0.045)) : 0;
+    var ix=v.x+pad, iy=v.y+pad;
+    var iw=Math.max(1,v.w-2*pad), ih=Math.max(1,v.h-2*pad-capH);
+
+    shade.setAttribute('x',v.x); shade.setAttribute('y',v.y);
+    shade.setAttribute('width',v.w); shade.setAttribute('height',v.h);
+    panel.setAttribute('x',v.x); panel.setAttribute('y',v.y);
+    panel.setAttribute('width',v.w); panel.setAttribute('height',v.h);
+
+    pic.setAttribute('x',ix); pic.setAttribute('y',iy);
+    pic.setAttribute('width',iw); pic.setAttribute('height',ih);
+
+    var r=Math.max(10,Math.min(17,minSide*0.024));
+    close.setAttribute('cx',v.x+v.w-pad-r); close.setAttribute('cy',v.y+pad+r);
+    close.setAttribute('r',r);
+    title.setAttribute('x',v.x+v.w-pad-r); title.setAttribute('y',v.y+pad+r+4);
+
+    cap.setAttribute('x',v.x+v.w/2);
+    cap.setAttribute('y',v.y+v.h-pad-Math.max(3,capH*0.18));
+    var fs=Math.max(9,Math.min(14,minSide*0.018));
+    cap.setAttribute('font-size',fs);
+  }
+  function hide(){
+    box.setAttribute('display','none');
+    pic.removeAttribute('href');
+    activeNode=null; activeHref='';
+  }
   function show(node){
     var file=node.getAttribute('data-file')||'', href=findSource(file,node);
     if(!href) return;
-    var v=viewportBox(), pad=Math.max(8,Math.min(v.w,v.h)*0.025);
-    shade.setAttribute('x',v.x); shade.setAttribute('y',v.y); shade.setAttribute('width',v.w); shade.setAttribute('height',v.h);
-    panel.setAttribute('x',v.x+pad); panel.setAttribute('y',v.y+pad); panel.setAttribute('width',Math.max(1,v.w-2*pad)); panel.setAttribute('height',Math.max(1,v.h-2*pad));
-    var capH=Math.max(22,Math.min(42,v.h*0.08));
-    pic.setAttribute('x',v.x+2*pad); pic.setAttribute('y',v.y+2*pad); pic.setAttribute('width',Math.max(1,v.w-4*pad)); pic.setAttribute('height',Math.max(1,v.h-4*pad-capH)); pic.setAttribute('href',href);
-    close.setAttribute('cx',v.x+v.w-2*pad); close.setAttribute('cy',v.y+2*pad); close.setAttribute('r',Math.max(9,Math.min(16,Math.min(v.w,v.h)*0.025)));
-    title.setAttribute('x',v.x+v.w-2*pad); title.setAttribute('y',v.y+2*pad+4);
-    cap.setAttribute('x',v.x+v.w/2); cap.setAttribute('y',v.y+v.h-pad-Math.max(6,capH*0.2));
+    activeNode=node; activeHref=href;
+    pic.setAttribute('href',activeHref);
     cap.textContent=(file+(node.getAttribute('data-cap')?' · '+node.getAttribute('data-cap'):''));
     box.setAttribute('display','inline');
+    layout();
   }
   root.addEventListener('click',function(e){
     if(box.getAttribute('display')!=='none'){
-      if(e.target===shade || e.target===panel || e.target===close || e.target===title){ e.preventDefault(); e.stopPropagation(); hide(); }
+      if(e.target===shade || e.target===panel || e.target===close || e.target===title){
+        e.preventDefault(); e.stopPropagation(); hide();
+      }
       return;
     }
     var n=e.target;
     while(n && n!==root && !(n.getAttribute && n.hasAttribute('data-file'))) n=n.parentNode;
-    if(n && n!==root && n.getAttribute && n.hasAttribute('data-file')){ e.preventDefault(); e.stopPropagation(); show(n); }
+    if(n && n!==root && n.getAttribute && n.hasAttribute('data-file')){
+      e.preventDefault(); e.stopPropagation(); show(n);
+    }
   },false);
   document.addEventListener('keydown',function(e){ if(e.key==='Escape' || e.keyCode===27) hide(); },false);
+
+  /* Keep the lightbox locked to the visible browser window. This matters
+     for a tall exported log: resize, orientation changes and scrolling can
+     all change the viewport while the preview is open. */
+  window.addEventListener('resize',layout,false);
+  window.addEventListener('orientationchange',layout,false);
+  window.addEventListener('scroll',layout,false);
+  if(window.visualViewport){
+    window.visualViewport.addEventListener('resize',layout,false);
+    window.visualViewport.addEventListener('scroll',layout,false);
+  }
 })();
 ]]>`;
       return `<g id="clv-svg-photo-lightbox" display="none" style="cursor:default">`
-           + `<rect id="clv-svg-photo-shade" fill="#000" fill-opacity="0.82"/>`
-           + `<rect id="clv-svg-photo-panel" fill="#111" fill-opacity="0.96" stroke="#fff" stroke-opacity="0.32" stroke-width="1" rx="4"/>`
+           + `<rect id="clv-svg-photo-shade" fill="#000" fill-opacity="0.92"/>`
+           + `<rect id="clv-svg-photo-panel" fill="#000" fill-opacity="0.98"/>`
            + `<image id="clv-svg-photo-big" preserveAspectRatio="xMidYMid meet"/>`
            + `<text id="clv-svg-photo-cap" text-anchor="middle" fill="#fff" font-family="'IBM Plex Sans',system-ui,sans-serif" font-size="13"> </text>`
            + `<circle id="clv-svg-photo-close" fill="#000" fill-opacity="0.72" stroke="#fff" stroke-width="1.2" style="cursor:pointer"/>`
@@ -15300,7 +15388,8 @@ document.getElementById("btnExportSvg").addEventListener("click", async ()=>{
     const combined =
       `<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n` +
       `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" ` +
-        `width="${w}" height="${totalH}" viewBox="0 0 ${w} ${totalH}" ` +
+        `width="${w}" height="${totalH}" viewBox="0 0 ${w} ${totalH}" preserveAspectRatio="xMinYMin meet" ` +
+        `style="display:block;width:100vw;min-width:${w}px;height:${totalH}px;overflow:hidden" ` +
         `font-family="'IBM Plex Sans',system-ui,sans-serif">` +
         `<style type="text/css"><![CDATA[${buildExportStyles()}]]></style>` +
         // Emit the shared defs block at the ROOT of the export SVG.
@@ -15374,16 +15463,17 @@ document.getElementById("btnExportSvg").addEventListener("click", async ()=>{
    PDF export — direct download (no print dialog)
    ===========================================================
    Builds the log SVG (well-info banner + header + body) and a separate
-   legend SVG, rasterises each to off-screen canvases, then slices into
-   page-sized tiles that get added to a multi-page jsPDF document.
+   legend source, then rasterises EACH physical page directly from SVG
+   vector coordinates at the final PDF DPI. Pages are edge-to-edge for
+   physical stitching: no generated headers/footers, no page numbers and
+   no artificial top/bottom margins between consecutive log slices.
 
-   Why slice rather than ask jsPDF/svg2pdf to render the SVG directly:
-   our SVG uses <foreignObject> for HTML-based labels, gradients,
-   patterns, and lots of styling via <style> tags. svg2pdf chokes on
-   foreignObject and gets gradient bbox wrong. Rasterising via the
-   native browser SVG renderer gives pixel-perfect output across every
-   feature, and slicing avoids the canvas size limits (~16k-32k px per
-   side) that a single tall canvas would hit on long logs.
+   Why page-render rather than ask jsPDF/svg2pdf to render SVG directly:
+   our SVG uses <foreignObject> for HTML-based labels, gradients, patterns,
+   and lots of styling via <style> tags. svg2pdf chokes on foreignObject and
+   gets gradient bbox wrong. Each page is therefore rendered by the native
+   browser SVG engine straight to a page-sized canvas, which preserves XRD
+   hatch/dot detail and avoids one enormous intermediate canvas.
 
    Auto-orientation: logs with many tracks get wide quickly. Forcing a
    wide log into portrait A4/A3 width compresses everything horizontally
@@ -15409,7 +15499,6 @@ const PDF_PAGE_SIZES = {
   a4: { w: 210, h: 297, label: "A4" },
   a3: { w: 297, h: 420, label: "A3" },
 };
-const PDF_MARGIN_MM = 10;   // uniform page margin
 const PDF_DPI       = 200;  // raster density — 200 DPI is a good
                             // balance between sharpness and file size
 
@@ -15564,140 +15653,89 @@ async function exportLogAsPdf(pageSizeKey){
       }
     }
 
+    // Remove the clone-local <defs> blocks before composing PDF page SVGs.
+    // renderHeader/renderBody each carry their own defs for the live view, but
+    // the PDF root supplies one canonical defsSvg() block. Duplicate SVG IDs
+    // (especially xrd-pat-*) are formally invalid and different rasterisation
+    // paths may resolve them differently. Keeping one definition makes XRD
+    // pattern lookup deterministic.
+    hdrClone.querySelectorAll("defs").forEach(d => d.remove());
+    bdyClone.querySelectorAll("defs").forEach(d => d.remove());
+
     const h1 = parseFloat(hdrSvg.getAttribute("height"));
     const h2 = parseFloat(bdySvg.getAttribute("height"));
     const w  = parseFloat(hdrSvg.getAttribute("width"));
 
     const innerOf = svgEl => {
-      const s = serializer.serializeToString(svgEl);
-      return s.replace(/^[^<]*<svg[^>]*>/,"").replace(/<\/svg>[^>]*$/,"");
+      const text = serializer.serializeToString(svgEl);
+      return text.replace(/^[^<]*<svg[^>]*>/,"").replace(/<\/svg>[^>]*$/ ,"");
     };
     const bgColor = cssVar("--bg-log") || "#FFFFFF";
 
-    // ---- Auto-orient: pick landscape if the log is too wide for
-    // portrait. Heuristic uses the CSS-standard 96-DPI mapping from
-    // SVG pixels to millimetres (1 SVG px ≈ 0.265 mm). If the natural
-    // log width exceeds the page's portrait printable width, landscape
-    // gives us roughly 40% more horizontal room and avoids the
-    // "compressed" look the user noticed for wide multi-track logs.
+    // ---- True edge-to-edge page geometry for physical stitching ----
+    // No PDF page margins, no generated header/footer bands and no page
+    // numbers. The log's own well/track header is ordinary document content
+    // and appears only once at the very beginning of the complete column.
     const cssMmPerPx = 25.4 / 96;
     const naturalLogWidthMm = w * cssMmPerPx;
-    const portraitInnerWmm  = ps.w - 2 * PDF_MARGIN_MM;
-    const landscapeInnerWmm = ps.h - 2 * PDF_MARGIN_MM;
+    const portraitInnerWmm  = ps.w;
+    const landscapeInnerWmm = ps.h;
     const useLandscape = naturalLogWidthMm > portraitInnerWmm;
     const orientation = useLandscape ? "landscape" : "portrait";
 
-    // Resolved page dimensions in mm given orientation. In landscape
-    // the page swaps width/height — printable area follows suit.
-    const pageW_mm = useLandscape ? (ps.h - 2 * PDF_MARGIN_MM) : (ps.w - 2 * PDF_MARGIN_MM);
-    const pageH_mm = useLandscape ? (ps.w - 2 * PDF_MARGIN_MM) : (ps.h - 2 * PDF_MARGIN_MM);
-    const docW_mm  = useLandscape ? ps.h : ps.w;
-    const docH_mm  = useLandscape ? ps.w : ps.h;
+    const docW_mm = useLandscape ? ps.h : ps.w;
+    const docH_mm = useLandscape ? ps.w : ps.h;
+    const pageW_mm = docW_mm;
+    const pageH_mm = docH_mm;
 
     const pxPerMm  = PDF_DPI / 25.4;
-    const pageW_px = Math.round(pageW_mm * pxPerMm);
-    const pageH_px = Math.round(pageH_mm * pxPerMm);
-    const wellBanner=buildWellInfoBannerSvg(w,fittedScaleText(w,pageW_mm));
-    const logH=wellBanner.height+h1+h2;
+    const pageW_px = Math.max(1, Math.round(pageW_mm * pxPerMm));
+    const pageH_px = Math.max(1, Math.round(pageH_mm * pxPerMm));
 
-    // ---- Log SVG (banner + header + body, NO legend) ----
-    // The legend gets its own SVG so its layout uses the page width
-    // directly (rather than being squeezed by the log's horizontal
-    // scale factor). This makes the legend swatches and text render
-    // at natural proportions on the legend page(s).
-    const logSvg =
-      `<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n` +
-      `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" ` +
-        `width="${w}" height="${logH}" viewBox="0 0 ${w} ${logH}" ` +
-        `font-family="'IBM Plex Sans',system-ui,sans-serif">` +
-        `<style type="text/css"><![CDATA[${buildExportStyles()}]]></style>` +
-        // Hoist defs to the root — same reasoning as in btnExportSvg
-        // above: guarantees every url(#fgdc-…) / lith-… / xrd-pat-…
-        // reference resolves regardless of clone serialisation quirks.
+    const wellBanner = buildWellInfoBannerSvg(w, fittedScaleText(w, pageW_mm));
+    const logH = wellBanner.height + h1 + h2;
+
+    // Build the log as one continuous source coordinate system. Crucially,
+    // the body is nested in a real <svg> viewport (not a plain <g>). This
+    // recreates the live view's clipping at y=0..h2, so the mirrored first/
+    // last XRD sample geometry cannot protrude above or below the body in PDF.
+    const logContent =
         defsSvg() +
-        `<rect width="100%" height="100%" fill="${bgColor}"/>` +
+        `<rect x="0" y="0" width="${w}" height="${logH}" fill="${bgColor}"/>` +
         (wellBanner.svg ? `<g class="well-banner">${wellBanner.svg}</g>` : "") +
         `<g class="hdr" transform="translate(0,${wellBanner.height})">${innerOf(hdrClone)}</g>` +
-        `<g class="bdy" transform="translate(0,${wellBanner.height + h1})">${innerOf(bdyClone)}</g>` +
-      `</svg>`;
+        `<svg class="bdy" x="0" y="${wellBanner.height + h1}" width="${w}" height="${h2}" ` +
+          `viewBox="0 0 ${w} ${h2}" overflow="hidden">${innerOf(bdyClone)}</svg>`;
 
-    // ---- Legend SVG ----
-    // Lay the legend out for the *page* width so the column count adapts
-    // to whatever room we have. Two competing goals:
-    //   1. Get enough columns that the legend fills the page horizontally
-    //      (a 2-col legend with a big empty right margin looks "wrong").
-    //   2. Keep font sizes legible — fonts get bigger when we scale a
-    //      smaller SVG up to fill the page.
-    //
-    // The legend's buildLegendForExport function picks columns as
-    //     cols = floor((width - 36) / 250)
-    // so to force N columns we need width ≈ N * 250 + 36. Pick N based
-    // on page size — 4 on A4, 6 on A3-ish pages — to land on a layout
-    // that uses most of the page width without cramming labels.
+    // ---- Legend source (kept after the stitched log pages) ----
     const targetCols = pageW_mm >= 260 ? 6 : (pageW_mm >= 180 ? 4 : 3);
-    const ITEM_W_LEGEND = 270;  // matches buildLegendForExport's ITEM_W
+    const ITEM_W_LEGEND = 270;
     const PAD_X_LEGEND  = 18;
     const legendNaturalWidth = targetCols * ITEM_W_LEGEND + 2 * PAD_X_LEGEND;
     const legend = buildLegendForExport(legendNaturalWidth);
-    const legendSvg = legend.svg
-      ? `<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n` +
-        `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" ` +
-          `width="${legendNaturalWidth}" height="${legend.height}" ` +
-          `viewBox="0 0 ${legendNaturalWidth} ${legend.height}" ` +
-          `font-family="'IBM Plex Sans',system-ui,sans-serif">` +
-          `<style type="text/css"><![CDATA[${buildExportStyles()}]]></style>` +
-          // Legend is rendered onto its own page in the PDF, so it
-          // needs its own copy of defs — there is no body SVG to
-          // resolve patterns from.
-          defsSvg() +
-          `<rect width="100%" height="100%" fill="${bgColor}"/>` +
-          `<g class="legend">${legend.svg}</g>` +
-        `</svg>`
+    const legendContent = legend.svg
+      ? defsSvg() +
+        `<rect x="0" y="0" width="${legendNaturalWidth}" height="${legend.height}" fill="${bgColor}"/>` +
+        `<g class="legend">${legend.svg}</g>`
       : null;
 
-    // ---- Rasterise log SVG to a single off-screen image ----
-    const logSvgBlob = new Blob([logSvg], {type: "image/svg+xml;charset=utf-8"});
-    const logSvgUrl  = URL.createObjectURL(logSvgBlob);
-    const logImg = await new Promise((resolve, reject) => {
-      const img = new Image();
-      img.onload = () => resolve(img);
-      img.onerror = () => reject(new Error("Failed to render log SVG to image"));
-      img.src = logSvgUrl;
-    });
+    // Source height represented by one physical page when the complete log is
+    // scaled to fill the page width. The next page starts at exactly the prior
+    // page's source end: no intentional overlap and no omitted source pixels.
+    const logMmPerSrcPx = pageW_mm / w;
+    const logSrcPerPage = pageH_mm / logMmPerSrcPx;
+    const logPageCount  = Math.max(1, Math.ceil(logH / logSrcPerPage - 1e-12));
 
-    // ---- Rasterise legend SVG (if any) ----
-    let legendImg = null, legendSvgUrl = null;
-    if (legendSvg){
-      const legendBlob = new Blob([legendSvg], {type: "image/svg+xml;charset=utf-8"});
-      legendSvgUrl = URL.createObjectURL(legendBlob);
-      legendImg = await new Promise((resolve, reject) => {
-        const img = new Image();
-        img.onload = () => resolve(img);
-        img.onerror = () => reject(new Error("Failed to render legend SVG to image"));
-        img.src = legendSvgUrl;
-      });
-    }
-
-    // ---- Pagination math for the log body ----
-    // Scale factor from source SVG px → page px so the log fills the
-    // page width. Then how many SVG px tall one page covers, and how
-    // many pages we'll need.
-    const logScale       = pageW_px / w;
-    const logSrcPerPage  = pageH_px / logScale;
-    const logPageCount   = Math.max(1, Math.ceil(logH / logSrcPerPage));
-
-    // Legend page count: legend uses its own 1:1 scale so it renders
-    // at natural size. Slice it into pages if it's taller than one
-    // page can hold.
-    let legendPageCount = 0, legendScale = 1, legendSrcPerPage = 0;
-    if (legendImg){
-      legendScale      = pageW_px / legendNaturalWidth;
-      legendSrcPerPage = pageH_px / legendScale;
-      legendPageCount  = Math.max(1, Math.ceil(legend.height / legendSrcPerPage));
+    let legendPageCount = 0;
+    let legendSrcPerPage = 0;
+    if (legendContent){
+      const legendMmPerSrcPx = pageW_mm / legendNaturalWidth;
+      legendSrcPerPage = pageH_mm / legendMmPerSrcPx;
+      legendPageCount = Math.max(1, Math.ceil(legend.height / legendSrcPerPage - 1e-12));
     }
     const totalPageCount = logPageCount + legendPageCount;
 
-    // ---- Initialise jsPDF with auto-selected orientation ----
+    // ---- Initialise jsPDF ----
     const pdf = new jsPDFCtor({
       orientation,
       unit: "mm",
@@ -15705,81 +15743,90 @@ async function exportLogAsPdf(pageSizeKey){
       compress: true,
     });
 
-    // Reusable canvas — resized per page to match actual content
-    // height. This avoids a subtle bug where a full-page canvas with
-    // content in only the top portion would get vertically compressed
-    // when addImage'd into a smaller usedH_mm box. Now the canvas is
-    // exactly the size of the content we want on the page; addImage
-    // places it at matching mm dimensions; no compression.
     const canvas = document.createElement("canvas");
-    const ctx = canvas.getContext("2d");
+    const ctx = canvas.getContext("2d", { alpha:false });
 
-    // Footer helper — well name (left), date (centre), page X of N
-    // (right). Called once per page after the image is placed.
-    const wi = state.wellInfo || {};
-    const wellName = wi.Well_Name || wi.Well_Id || "Core Log";
-    const date = new Date().toISOString().slice(0, 10);
-    const drawFooter = (pageIdx, isLegendPage) => {
-      pdf.setFontSize(8);
-      pdf.setTextColor(120, 120, 120);
-      const footerY = docH_mm - PDF_MARGIN_MM / 2;
-      const tag = isLegendPage ? (state.lang === "ru" ? " · Легенда" : " · Legend") : "";
-      pdf.text(`${wellName}${tag}`, PDF_MARGIN_MM, footerY);
-      pdf.text(`${date}`, docW_mm / 2, footerY, { align: "center" });
-      pdf.text(
-        (state.lang === "ru" ? "Стр. " : "Page ") + `${pageIdx + 1} / ${totalPageCount}`,
-        docW_mm - PDF_MARGIN_MM, footerY, { align: "right" }
-      );
-    };
+    // Rasterise ONE page slice directly from SVG vector coordinates at final
+    // print resolution. This replaces the old "one huge SVG image -> crop ->
+    // JPEG" path. Fine XRD dots/hatches are therefore resolved at PDF DPI and
+    // are stored losslessly rather than being altered by JPEG ringing/moire.
+    const renderSvgSliceToPng = async (content, fullW, fullH, srcY, srcH, destW, destH) => {
+      const sliceSvg =
+        `<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n` +
+        `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" ` +
+          `width="${destW}" height="${destH}" viewBox="0 ${srcY} ${fullW} ${srcH}" ` +
+          `preserveAspectRatio="none" font-family="'IBM Plex Sans',system-ui,sans-serif">` +
+          `<style type="text/css"><![CDATA[${buildExportStyles()}]]></style>` +
+          content +
+        `</svg>`;
 
-    // ---- Render log pages ----
-    for (let p = 0; p < logPageCount; p++){
-      const srcY      = p * logSrcPerPage;
-      const srcHeight = Math.min(logSrcPerPage, logH - srcY);
-      const destH     = Math.round(srcHeight * logScale);
-      // Size canvas to actual content height — never compressed when
-      // addImage'd at the matching mm size below.
-      canvas.width  = pageW_px;
-      canvas.height = destH;
-      ctx.fillStyle = "#FFFFFF";
-      ctx.fillRect(0, 0, pageW_px, destH);
-      ctx.drawImage(logImg, 0, srcY, w, srcHeight, 0, 0, pageW_px, destH);
+      // Validate generated XML before handing it to the image decoder.
+      const parsed = new DOMParser().parseFromString(sliceSvg, "image/svg+xml");
+      const perr = parsed.querySelector("parsererror");
+      if (perr){
+        const msg = (perr.textContent || "SVG parse error").replace(/\s+/g," ").trim().slice(0,220);
+        throw new Error("PDF page SVG does not parse: " + msg);
+      }
 
-      const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
-      if (p > 0) pdf.addPage(pageSizeKey, orientation);
-      const usedH_mm = destH / pxPerMm;
-      pdf.addImage(dataUrl, "JPEG", PDF_MARGIN_MM, PDF_MARGIN_MM, pageW_mm, usedH_mm, undefined, "FAST");
-      drawFooter(p, false);
-    }
-
-    // ---- Render legend page(s) ----
-    // Legend renders at its own scale (chosen for sensible column
-    // count). If the legend is taller than one page, slice it
-    // vertically across multiple pages. Same canvas-sizing approach as
-    // the log: dynamic height matching actual content so addImage
-    // doesn't vertically compress.
-    if (legendImg){
-      for (let p = 0; p < legendPageCount; p++){
-        const srcY      = p * legendSrcPerPage;
-        const srcHeight = Math.min(legendSrcPerPage, legend.height - srcY);
-        const destH     = Math.round(srcHeight * legendScale);
-        canvas.width  = pageW_px;
+      const url = URL.createObjectURL(new Blob([sliceSvg], {type:"image/svg+xml;charset=utf-8"}));
+      try {
+        const img = await new Promise((resolve, reject) => {
+          const im = new Image();
+          im.onload = () => resolve(im);
+          im.onerror = () => reject(new Error("Failed to rasterise PDF page SVG"));
+          im.src = url;
+        });
+        canvas.width = destW;
         canvas.height = destH;
         ctx.fillStyle = "#FFFFFF";
-        ctx.fillRect(0, 0, pageW_px, destH);
-        ctx.drawImage(legendImg, 0, srcY, legendNaturalWidth, srcHeight, 0, 0, pageW_px, destH);
+        ctx.fillRect(0, 0, destW, destH);
+        // Four-argument drawImage lets the browser rasterise the vector SVG at
+        // the destination resolution. We never crop a pre-rasterised tall image.
+        ctx.drawImage(img, 0, 0, destW, destH);
+        return canvas.toDataURL("image/png");
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    };
 
-        const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+    // ---- Continuous stitched log pages ----
+    for (let p = 0; p < logPageCount; p++){
+      const srcY = p * logSrcPerPage;
+      const srcH = Math.min(logSrcPerPage, logH - srcY);
+      const isFullPage = p < logPageCount - 1 || srcH >= logSrcPerPage - 1e-7;
+      const destH = isFullPage
+        ? pageH_px
+        : Math.max(1, Math.round(pageW_px * srcH / w));
+
+      const dataUrl = await renderSvgSliceToPng(logContent, w, logH, srcY, srcH, pageW_px, destH);
+      if (p > 0) pdf.addPage(pageSizeKey, orientation);
+
+      // Full pages touch all four PDF edges. Last partial page keeps the same
+      // physical vertical scale and simply ends where the log ends.
+      const usedH_mm = isFullPage ? pageH_mm : (srcH * pageW_mm / w);
+      pdf.addImage(dataUrl, "PNG", 0, 0, pageW_mm, usedH_mm, undefined, "FAST");
+    }
+
+    // ---- Legend page(s), also without generated page furniture ----
+    if (legendContent){
+      for (let p = 0; p < legendPageCount; p++){
+        const srcY = p * legendSrcPerPage;
+        const srcH = Math.min(legendSrcPerPage, legend.height - srcY);
+        const isFullPage = p < legendPageCount - 1 || srcH >= legendSrcPerPage - 1e-7;
+        const destH = isFullPage
+          ? pageH_px
+          : Math.max(1, Math.round(pageW_px * srcH / legendNaturalWidth));
+        const dataUrl = await renderSvgSliceToPng(
+          legendContent, legendNaturalWidth, legend.height,
+          srcY, srcH, pageW_px, destH
+        );
         pdf.addPage(pageSizeKey, orientation);
-        const usedH_mm = destH / pxPerMm;
-        pdf.addImage(dataUrl, "JPEG", PDF_MARGIN_MM, PDF_MARGIN_MM, pageW_mm, usedH_mm, undefined, "FAST");
-        drawFooter(logPageCount + p, true);
+        const usedH_mm = isFullPage ? pageH_mm : (srcH * pageW_mm / legendNaturalWidth);
+        pdf.addImage(dataUrl, "PNG", 0, 0, pageW_mm, usedH_mm, undefined, "FAST");
       }
     }
 
-    // Done — release SVG URLs and download the PDF.
-    URL.revokeObjectURL(logSvgUrl);
-    if (legendSvgUrl) URL.revokeObjectURL(legendSvgUrl);
+    const wi = state.wellInfo || {};
     const baseName = (wi.Well_Name || wi.Well_Id || "core_log").replace(/[^\w.-]+/g, "_");
     const orientTag = useLandscape ? "L" : "P";
     const filename = `${baseName}_log_${ps.label}${orientTag}.pdf`;
@@ -15793,7 +15840,7 @@ async function exportLogAsPdf(pageSizeKey){
       : (useLandscape ? "landscape" : "portrait");
     showBanner(
       (state.lang === "ru" ? "PDF сохранён: " : "PDF saved: ") + filename +
-      ` (${totalPageCount} ${pageWord}, ${ps.label} ${orientWord})`,
+      ` (${totalPageCount} ${pageWord}, ${ps.label} ${orientWord}, edge-to-edge)`,
       "ok"
     );
   } catch (err){
